@@ -15,6 +15,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import threading
 import unittest
 
 try:
@@ -1716,6 +1717,189 @@ class GPGTestCase(unittest.TestCase):
         andrew = key.fingerprint
         stream = io.StringIO(u'Hello, world!')  # make the wrong type of stream
         self.assertRaises(TypeError, self.gpg.encrypt_file, stream, [andrew], armor=False)
+
+
+class FakePipe(object):
+    """An in-memory stand-in for the pipes of a subprocess."""
+
+    def __init__(self, initial=b'', fail_after=None, exc=None):
+        self._buffer = io.BytesIO(initial)
+        self.closed = False
+        # fail_after: number of bytes accepted before writes start failing,
+        # modelling a child which has already exited and closed its pipe.
+        self.fail_after = fail_after
+        self.exc = exc
+        self.accepted = 0
+
+    def write(self, data):
+        if self.closed:
+            raise ValueError('write to closed pipe')
+        if self.fail_after is not None and self.accepted >= self.fail_after:
+            raise self.exc
+        self.accepted += len(data)
+        self._buffer.write(data)
+        return len(data)
+
+    def read(self, size=-1):
+        return self._buffer.read(size)
+
+    def readline(self):
+        return self._buffer.readline()
+
+    def close(self):
+        self.closed = True
+
+    def getvalue(self):
+        return self._buffer.getvalue()
+
+
+class FakeProcess(object):
+    """A stand-in for a subprocess.Popen instance."""
+
+    def __init__(self, cmd, fail_after=None, exc=None, returncode=2, stdout_data=b''):
+        self.cmd = cmd
+        self.pid = 0
+        self.returncode = None
+        self.stdin = FakePipe(fail_after=fail_after, exc=exc)
+        self.stdout = FakePipe(initial=stdout_data)
+        self.stderr = FakePipe()
+        self._returncode = returncode
+        self.waited = False
+
+    def wait(self):
+        self.waited = True
+        self.returncode = self._returncode
+        return self.returncode
+
+
+class PassphraseSubprocessTestCase(unittest.TestCase):
+    """Check passphrase handling without spawning a real gpg binary."""
+
+    # Marker values which must never appear in any log record.
+    secret_passphrase = 's3cr\xe9t-p\xe4ss'  # non-ASCII, latin-1 encodable
+    secret_body = b'confidential payload that must stay out of the logs'
+
+    def setUp(self):
+        self.homedir = tempfile.mkdtemp(prefix='passphrase-')
+        self.processes = []
+        self._real_popen = gnupg.Popen
+        self.fail_after = None
+        self.write_exc = None
+        gnupg.Popen = self._make_popen()
+        self.gpg = gnupg.GPG(gnupghome=self.homedir, gpgbinary=GPGBINARY)
+        self.log_records = []
+        self.handler = logging.Handler()
+        self.handler.emit = self.log_records.append
+        self.logger = logging.getLogger('gnupg')
+        self.logger.addHandler(self.handler)
+        self.saved_level = self.logger.level
+        self.logger.setLevel(logging.DEBUG)
+
+    def tearDown(self):
+        self.logger.removeHandler(self.handler)
+        self.logger.level = self.saved_level
+        gnupg.Popen = self._real_popen
+        shutil.rmtree(self.homedir, ignore_errors=True)
+
+    def _make_popen(self):
+        version_probe = b'cfg:version:2.5.24\n'
+
+        def popen(cmd, *args, **kwargs):
+            if '--list-config' in cmd:
+                process = FakeProcess(cmd, returncode=0, stdout_data=version_probe)
+            else:
+                process = FakeProcess(cmd, fail_after=self.fail_after, exc=self.write_exc)
+            self.processes.append(process)
+            return process
+
+        return popen
+
+    def _last_process(self):
+        # The first process is the constructor's version probe.
+        return self.processes[-1]
+
+    def _assert_no_secret_logged(self):
+        rendered = '\n'.join(self._format_record(record) for record in self.log_records)
+        self.assertNotIn(self.secret_passphrase, rendered)
+        self.assertNotIn(self.secret_body.decode('latin-1'), rendered)
+
+    @staticmethod
+    def _format_record(record):
+        try:
+            return record.getMessage()
+        except Exception:  # pragma: no cover
+            return record.msg
+
+    def test_validation_before_subprocess_starts(self):
+        # The child must never be launched and nothing written to its stdin
+        # when the passphrase contains NUL, CR or LF. Covers every public
+        # entry point which sends a passphrase over stdin.
+        bad_passphrases = ('line\nbreak', 'carriage\rreturn', 'nul\x00byte')
+        bad_inputs = [
+            ('import_keys', (b'key material',), {'passphrase': None}),
+            ('decrypt_file', (io.BytesIO(b'ciphertext'),), {'passphrase': None}),
+            ('sign_file', (io.BytesIO(b'message'),), {'passphrase': None}),
+            ('encrypt_file', (io.BytesIO(b'message'), None), {'passphrase': None, 'symmetric': True}),
+        ]
+        for name, args, kwargs in bad_inputs:
+            method = getattr(self.gpg, name)
+            for bad in bad_passphrases:
+                baseline = len(self.processes)
+                kwargs['passphrase'] = bad
+                self.assertRaises(ValueError, method, *args, **kwargs)
+                self.assertEqual(baseline, len(self.processes),
+                                 '%s launched a subprocess for invalid passphrase %r' % (name, bad))
+                for process in self.processes[baseline:]:
+                    self.assertEqual(b'', process.stdin.getvalue(),
+                                     '%s wrote stdin for invalid passphrase' % name)
+
+    def test_non_ascii_passphrase_is_preserved(self):
+        body = b'data'
+        result = self.gpg.decrypt_file(io.BytesIO(body), passphrase=self.secret_passphrase)
+        self.assertIsNotNone(result)
+        payload = self._last_process().stdin.getvalue()
+        expected = self.secret_passphrase.encode('latin-1') + b'\n' + body
+        self.assertEqual(expected, payload)
+        self._assert_no_secret_logged()
+
+    def test_empty_passphrase_skips_the_passphrase_line(self):
+        # A falsy passphrase ('' or None) means no passphrase line is sent at
+        # all, so the body alone is written to stdin.
+        body = b'data'
+        result = self.gpg.decrypt_file(io.BytesIO(body), passphrase='')
+        self.assertIsNotNone(result)
+        self.assertEqual(body, self._last_process().stdin.getvalue())
+        result = self.gpg.decrypt_file(io.BytesIO(body), passphrase=None)
+        self.assertIsNotNone(result)
+        self.assertEqual(body, self._last_process().stdin.getvalue())
+
+    def test_body_with_leading_newline_is_distinct_from_passphrase(self):
+        body = b'\n\nstarts with newlines'
+        passphrase = 'hunter2'
+        result = self.gpg.import_keys(body, passphrase=passphrase)
+        self.assertIsNotNone(result)
+        payload = self._last_process().stdin.getvalue()
+        self.assertEqual(passphrase.encode('latin-1') + b'\n' + body, payload)
+        self.assertTrue(payload.startswith(passphrase.encode('latin-1') + b'\n\n\n'))
+
+    def test_early_child_exit_surfaces_writer_error_and_cleans_up(self):
+        # Simulate gpg exiting after reading only the passphrase: subsequent
+        # body writes hit a broken pipe.
+        passphrase = 'hunter2'
+        body = io.BytesIO(self.secret_body)
+        fail_after = len(passphrase) + 1  # passphrase plus its trailing newline
+        self.fail_after = fail_after
+        self.write_exc = IOError('broken pipe')
+        self.assertRaises(IOError, self.gpg.decrypt_file, body, passphrase=passphrase)
+        process = self._last_process()
+        self.assertTrue(process.stdin.closed, 'stdin pipe was not closed')
+        self.assertTrue(process.waited, 'the child process was not waited on')
+        # Nothing should be left running or blocked.
+        for thread in threading.enumerate():
+            if thread is not threading.current_thread():
+                self.assertFalse(thread.is_alive() and thread.daemon,
+                                 'a writer/reader thread was left running')
+        self._assert_no_secret_logged()
 
 
 TEST_GROUPS = {

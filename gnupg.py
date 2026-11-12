@@ -1618,6 +1618,8 @@ class GPG(object):
 
             extra_args (list[str]): Additional arguments to pass to `gpg`.
         """
+        if passphrase and not self.is_valid_passphrase(passphrase):
+            raise ValueError('Invalid passphrase')
         result = self.result_map['import'](self)
         logger.debug('import_keys: %r', key_data[:256])
         data = _make_binary_stream(key_data, self.encoding)
