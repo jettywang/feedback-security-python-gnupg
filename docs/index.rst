@@ -184,6 +184,10 @@ env (defaults to ``None``)
     executable.
 encoding (defaults to ``'latin-1'``)
     If specified, the value is used as the encoding to use for the instance.
+status_channel (defaults to ``'fd'`` on POSIX and ``'file'`` on Windows)
+    Selects how machine-readable ``[GNUPG:]`` status messages are read. Use ``'fd'``
+    for a separate inherited file descriptor, ``'file'`` for a separate temporary
+    status file, or ``'stderr'`` for the legacy multiplexed stderr arrangement.
 
 .. versionchanged:: 0.3.4
    The ``keyring`` argument can now also be a list of keyring filenames.
@@ -211,10 +215,11 @@ If the ``gpgbinary`` executable cannot be found, a ``ValueError`` is raised in
 :meth:`GPG.__init__`.
 
 The low-level communication between the ``gpg`` executable and ``python-gnupg`` is in
-terms of bytes, and ``python-gnupg`` tries to convert gpg's ``stderr`` stream to text
-using an encoding. The default value of this is ``latin-1``, but you can override this
-by setting the encoding name in the GPG instance's ``encoding`` attribute after
-instantiation, like this::
+terms of bytes. Human-readable diagnostics are read from gpg's ``stderr`` stream and
+machine-readable ``[GNUPG:]`` status messages are read from a separate status channel.
+Both are converted to text using an encoding. The default value of this is
+``latin-1``, but you can override this by setting the encoding name in the GPG
+instance's ``encoding`` attribute after instantiation, like this::
 
     >>> gpg = gnupg.GPG(gnupghome='/path/to/home/directory')
     >>> gpg.encoding = 'utf-8'
@@ -239,6 +244,37 @@ It defaults to 16K.
 
 .. versionadded:: 0.5.2
    The ``buffer_size`` attribute was added.
+
+Status and diagnostic channels
+------------------------------
+
+A result object's ``data`` attribute holds gpg's stdout, while its ``stderr`` and
+``diagnostics`` attributes hold only gpg's human-readable diagnostics. The raw
+machine-readable status stream is available as ``status_lines`` (text) and
+``status_records`` (a list of ``(key, value)`` tuples). Existing semantic attributes
+such as ``status``, ``valid``, ``ok`` and ``problems`` continue to be populated only
+from the dedicated status channel.
+
+On POSIX platforms (Linux, macOS and other Unix-like systems), the default
+``status_channel='fd'`` passes gpg an additional inherited file descriptor using
+``--status-fd``. CPython 3.2 and later use ``subprocess``'s ``pass_fds`` so that only
+the status descriptor is inherited; Python 2.7 uses ``close_fds=False`` for the same
+descriptor. On native Windows, where arbitrary file descriptors cannot be passed
+through ``subprocess``, the default is ``status_channel='file'``, which uses a
+temporary file and a gpg executable supporting ``--status-file``. If a gpg executable
+does not support that option, a POSIX system falls back to ``'fd'``; a Windows system
+falls back to the legacy ``'stderr'`` channel unless ``status_channel='file'`` was
+requested explicitly, in which case a ``ValueError`` is raised. Set
+``status_channel='stderr'`` to explicitly use the legacy combined stderr arrangement,
+where lines are classified by their ``[GNUPG:]`` prefix.
+
+A diagnostic which happens to begin with ``[GNUPG:]`` is retained in ``stderr`` and
+is also logged as a warning, but it is not interpreted as a status message when a
+dedicated status channel is in use.
+
+.. versionadded:: 0.5.8
+   The ``status_channel`` argument and the ``diagnostics``, ``status_lines`` and
+   ``status_records`` result attributes were added.
 
 
 .. index:: Key; management

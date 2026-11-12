@@ -47,6 +47,7 @@ import re
 import socket
 from subprocess import Popen, PIPE
 import sys
+import tempfile
 import threading
 
 __version__ = '0.5.8.dev0'
@@ -82,6 +83,12 @@ if not logger.handlers:
 #
 # For now, only debug logging of chunks falls into the optionally-logged category.
 log_everything = False
+
+STATUS_PREFIX = '[GNUPG:] '
+# Windows does not support inheriting arbitrary descriptors through subprocess.
+HAS_STATUS_FD = os.name == 'posix'
+STATUS_CHANNELS = ('fd', 'file', 'stderr')
+DEFAULT_STATUS_CHANNEL = 'fd' if HAS_STATUS_FD else 'file'
 
 # We use the test below because it works for Jython as well as CPython
 if os.path.__name__ == 'ntpath':  # pragma: no cover
@@ -233,6 +240,17 @@ class StatusHandler(object):
             gpg (GPG): The :class:`GPG` instance in use.
         """
         self.gpg = gpg
+        self.data = ''
+        self.stderr = ''
+        self.status_lines = ''
+        self.status_records = []
+
+    @property
+    def diagnostics(self):
+        """
+        Get the diagnostic text received from the `gpg` child process.
+        """
+        return self.stderr
 
     def handle_status(self, key, value):
         """
@@ -1106,7 +1124,8 @@ class GPG(object):
                  options=None,
                  secret_keyring=None,
                  env=None,
-                 encoding='latin-1'):
+                 encoding='latin-1',
+                 status_channel=None):
         """Initialize a GPG process wrapper.
 
         Args:
@@ -1124,6 +1143,12 @@ class GPG(object):
                                        keyring files.
 
             env (dict): A dict of environment variables to be used for the GPG subprocess.
+
+            encoding (str): The encoding used to decode streams and encode passphrases.
+
+            status_channel (str): The channel used for machine-readable status messages. This is either
+                                  ``'fd'``, ``'file'`` or ``'stderr'``. The default is ``'fd'`` on POSIX and
+                                  ``'file'`` on Windows.
         """
         self.gpgbinary = gpgbinary
         self.gnupghome = gnupghome
@@ -1156,6 +1181,22 @@ class GPG(object):
         self.encoding = encoding
         if gnupghome and not os.path.isdir(self.gnupghome):  # pragma: no cover
             os.makedirs(self.gnupghome, 0o700)
+        explicit_status_channel = status_channel is not None
+        if status_channel is None:
+            status_channel = DEFAULT_STATUS_CHANNEL
+        if status_channel not in STATUS_CHANNELS:
+            raise ValueError('Invalid status_channel %r; must be one of %s' % (status_channel,
+                                                                               ', '.join(STATUS_CHANNELS)))
+        if status_channel == 'fd' and not HAS_STATUS_FD:
+            raise ValueError("status_channel='fd' is only supported on POSIX platforms")
+        self.status_channel = status_channel
+        if status_channel == 'file' and not self._supports_status_file():
+            if not HAS_STATUS_FD:
+                if explicit_status_channel:
+                    raise ValueError("This gpg executable does not support --status-file")
+                self.status_channel = 'stderr'
+            else:
+                self.status_channel = 'fd'
         try:
             p = self._open_subprocess(['--list-config', '--with-colons'])
         except OSError:
@@ -1177,7 +1218,27 @@ class GPG(object):
         # can't be too strict.
         self.check_fingerprint_collisions = False
 
-    def make_args(self, args, passphrase):
+    def _supports_status_file(self):
+        """
+        Return whether the gpg executable accepts the ``--status-file`` option.
+        """
+        cmd = [self.gpgbinary, '--dump-options']
+        startupinfo = None
+        if STARTUPINFO:  # pragma: no cover
+            startupinfo = STARTUPINFO()
+            startupinfo.dwFlags = STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = SW_HIDE
+        try:
+            p = Popen(cmd, shell=False, stdout=PIPE, stderr=PIPE, startupinfo=startupinfo, env=self.env)
+            data, _ = p.communicate()
+        except OSError:
+            return False
+        if p.returncode != 0:
+            return False
+        options = data.decode(self.encoding, 'ignore').splitlines()
+        return '--status-file' in options
+
+    def make_args(self, args, passphrase, status_fd=None, status_file=None):
         """
         Make a list of command line elements for GPG. The value of ``args``
         will be appended. The ``passphrase`` argument needs to be True if
@@ -1186,13 +1247,21 @@ class GPG(object):
         Args:
             args (list[str]): A list of arguments.
             passphrase (str): The passphrase to use.
+            status_fd (int): The file descriptor to use for gpg status messages.
+            status_file (str): The file to use for gpg status messages.
         """
-        cmd = [self.gpgbinary, '--status-fd', '2', '--no-tty', '--no-verbose']
+        if status_fd is not None:
+            status_args = ['--status-fd', str(status_fd)]
+        elif status_file is not None:
+            status_args = ['--status-file', no_quote(status_file)]
+        else:
+            status_args = ['--status-fd', '2']
+        cmd = [self.gpgbinary] + status_args + ['--no-tty', '--no-verbose']
         if 'DEBUG_IPC' in os.environ:  # pragma: no cover
             cmd.extend(['--debug', 'ipc'])
         if passphrase and hasattr(self, 'version'):
             if self.version >= (2, 1):
-                cmd[1:1] = ['--pinentry-mode', 'loopback']
+                cmd[3:3] = ['--pinentry-mode', 'loopback']
         cmd.extend(['--fixed-list-mode', '--batch', '--with-colons'])
         if self.gnupghome:
             cmd.extend(['--homedir', no_quote(self.gnupghome)])
@@ -1212,13 +1281,31 @@ class GPG(object):
         cmd.extend(args)
         return cmd
 
+    def _open_status_channel(self):
+        """
+        Open the channel used to receive machine-readable status messages from `gpg`.
+        """
+        status_fd = None
+        status_file = None
+        status_input = None
+        if self.status_channel == 'fd':
+            read_fd, write_fd = os.pipe()
+            status_fd = write_fd
+            status_input = read_fd
+        elif self.status_channel == 'file':
+            status_fd, status_file = tempfile.mkstemp(prefix='pygpg-status-')
+            os.close(status_fd)
+            status_fd = None
+        return status_fd, status_file, status_input
+
     def _open_subprocess(self, args, passphrase=False):
         # Internal method: open a pipe to a GPG subprocess and return
         # the file objects for communicating with it.
 
         from subprocess import list2cmdline as debug_print
 
-        cmd = self.make_args(args, passphrase)
+        status_fd, status_file, status_input = self._open_status_channel()
+        cmd = self.make_args(args, passphrase, status_fd=status_fd, status_file=status_file)
         if self.verbose:  # pragma: no cover
             print(debug_print(cmd))
         if not STARTUPINFO:
@@ -1227,37 +1314,116 @@ class GPG(object):
             si = STARTUPINFO()
             si.dwFlags = STARTF_USESHOWWINDOW
             si.wShowWindow = SW_HIDE
-        result = Popen(cmd, shell=False, stdin=PIPE, stdout=PIPE, stderr=PIPE, startupinfo=si, env=self.env)
-        logger.debug('%s: %s', result.pid, debug_print(cmd))
-        return result
+        kwargs = dict(shell=False, stdin=PIPE, stdout=PIPE, stderr=PIPE, startupinfo=si, env=self.env)
+        if status_fd is not None:
+            if sys.version_info[0] >= 3:
+                kwargs['pass_fds'] = (status_fd, )
+            else:
+                kwargs['close_fds'] = False
+        try:
+            process = Popen(cmd, **kwargs)
+        except Exception:
+            if status_fd is not None:
+                os.close(status_fd)
+            if status_input is not None:
+                os.close(status_input)
+            if status_file is not None:
+                try:
+                    os.remove(status_file)
+                except OSError:  # pragma: no cover
+                    pass
+            raise
+        process.status_channel = self.status_channel
+        process.status_fd = status_fd
+        process.status_file = status_file
+        process.status_input = status_input
+        if status_input is not None:
+            os.close(status_fd)
+        logger.debug('%s: %s', process.pid, debug_print(cmd))
+        return process
 
-    def _read_response(self, stream, result):
-        # Internal method: reads all the stderr output from GPG, taking notice
-        # only of lines that begin with the magic [GNUPG:] prefix.
-        #
-        # Calls methods on the response object for each valid token found,
-        # with the arg being the remainder of the status line.
+    def _parse_status_line(self, line, result):
+        """
+        Parse a line read from the dedicated gpg status channel.
+        """
+        if line.startswith(STATUS_PREFIX):
+            line = line[len(STATUS_PREFIX):]
+            parts = line.split(None, 1)
+            if not parts:
+                logger.debug('ignoring empty status message')
+                return
+            keyword = parts[0]
+            value = parts[1] if len(parts) > 1 else ''
+            result.handle_status(keyword, value)
+            result.status_records.append((keyword, value))
+
+    def _parse_status_text(self, text, result):
+        """
+        Parse complete status text, including data without a terminating newline.
+        """
+        for line in text.splitlines():
+            if line:
+                self._parse_status_line(line, result)
+
+    def _read_status(self, stream, result):
+        """
+        Read machine-readable status messages from the dedicated status channel.
+        """
         lines = []
         while True:
             line = stream.readline()
             if len(line) == 0:
                 break
             lines.append(line)
-            line = line.rstrip()
+            text = line.rstrip()
             if self.verbose:  # pragma: no cover
-                print(line)
-            logger.debug('%s', line)
-            if line[0:9] == '[GNUPG:] ':
-                # Chop off the prefix
-                line = line[9:]
-                L = line.split(None, 1)
-                keyword = L[0]
-                if len(L) > 1:
-                    value = L[1]
-                else:
-                    value = ''
-                result.handle_status(keyword, value)
+                print(text)
+            logger.debug('status: %s', text)
+            self._parse_status_line(text, result)
+        result.status_lines = ''.join(lines)
+
+    def _read_diagnostics(self, stream, result):
+        """
+        Read human-readable diagnostics from gpg's stderr stream.
+        """
+        lines = []
+        while True:
+            line = stream.readline()
+            if len(line) == 0:
+                break
+            lines.append(line)
+            text = line.rstrip()
+            if self.verbose:  # pragma: no cover
+                print(text)
+            logger.debug('%s', text)
+            if text.startswith(STATUS_PREFIX):
+                logger.warning('status text found on diagnostic channel: %s', text)
         result.stderr = ''.join(lines)
+
+    def _read_response(self, stream, result):
+        # Internal method: reads all the stderr output from GPG, taking notice
+        # only of lines that begin with the magic [GNUPG:] prefix.
+        #
+        # This legacy mode is only used when a dedicated status channel cannot
+        # be made available. Calls methods on the response object for each valid
+        # token found, with the arg being the remainder of the status line.
+        diagnostics = []
+        status = []
+        while True:
+            line = stream.readline()
+            if len(line) == 0:
+                break
+            text = line.rstrip()
+            if self.verbose:  # pragma: no cover
+                print(text)
+            logger.debug('%s', text)
+            if text.startswith(STATUS_PREFIX):
+                status.append(line)
+            else:
+                diagnostics.append(line)
+        result.stderr = ''.join(diagnostics)
+        result.status_lines = ''.join(status)
+        self._parse_status_text(result.status_lines, result)
 
     def _read_data(self, stream, result, on_data=None, buffer_size=1024):
         # Read the contents of the file from GPG's stdout
@@ -1300,34 +1466,70 @@ class GPG(object):
         to the subprocess) is given, make sure it's joined before returning. If a stdin stream is given, close it
         before returning.
         """
+        status_channel = getattr(process, 'status_channel', self.status_channel)
+        status_file = getattr(process, 'status_file', None)
+        status_stream = None
+        threads = []
         stderr = codecs.getreader(self.encoding)(process.stderr)
-        rr = threading.Thread(target=self._read_response, args=(stderr, result))
+
+        def run_diagnostics():
+            reader = self._read_diagnostics if status_channel != 'stderr' else self._read_response
+            reader(stderr, result)
+
+        rr = threading.Thread(target=run_diagnostics)
         rr.daemon = True
         logger.debug('stderr reader: %r', rr)
-        rr.start()
+        threads.append(rr)
 
         stdout = process.stdout
         dr = threading.Thread(target=self._read_data, args=(stdout, result, self.on_data, self.buffer_size))
         dr.daemon = True
         logger.debug('stdout reader: %r', dr)
-        dr.start()
+        threads.append(dr)
 
-        dr.join()
-        rr.join()
-        if writer is not None:
-            writer.join(0.01)
-        process.wait()
-        result.returncode = rc = process.returncode
-        if rc != 0:
-            logger.warning('gpg returned a non-zero error code: %d', rc)
-        if stdin is not None:
-            try:
-                stdin.close()
-            except IOError:  # pragma: no cover
-                pass
-        stderr.close()
-        stdout.close()
-        return rc
+        if status_channel == 'fd':
+            status_stream = codecs.getreader(self.encoding)(os.fdopen(process.status_input, 'rb'))
+            sr = threading.Thread(target=self._read_status, args=(status_stream, result))
+            sr.daemon = True
+            logger.debug('status reader: %r', sr)
+            threads.append(sr)
+
+        for thread in threads:
+            thread.start()
+        try:
+            for thread in threads:
+                thread.join()
+            if writer is not None:
+                writer.join(0.01)
+            process.wait()
+            result.returncode = process.returncode
+            if result.returncode != 0:
+                logger.warning('gpg returned a non-zero error code: %d', result.returncode)
+            if status_channel == 'file':
+                try:
+                    with codecs.open(status_file, encoding=self.encoding) as stream:
+                        text = stream.read()
+                except OSError:  # pragma: no cover
+                    text = ''
+                    logger.exception('Unable to read gpg status file: %s', status_file)
+                result.status_lines = text
+                self._parse_status_text(text, result)
+            if stdin is not None:
+                try:
+                    stdin.close()
+                except (IOError, OSError):  # pragma: no cover
+                    pass
+        finally:
+            stderr.close()
+            stdout.close()
+            if status_stream is not None:
+                status_stream.close()
+            if status_file is not None:
+                try:
+                    os.remove(status_file)
+                except OSError:  # pragma: no cover
+                    pass
+        return result.returncode
 
     def is_valid_file(self, fileobj):
         """
@@ -1370,8 +1572,13 @@ class GPG(object):
             self._collect_output(p, result, writer, stdin)
             try:
                 exc = error_queue.get_nowait()
-                # if we get here, that means an error occurred in the copying thread
-                raise exc
+                # If gpg exits before reading all input, a broken pipe in the
+                # copying thread is expected and the collected result is still
+                # useful for diagnosing the failure.
+                if isinstance(exc, (IOError, OSError)) and result.returncode:
+                    logger.warning('Ignoring input copy failure after gpg exit: %s', exc)
+                else:
+                    raise exc
             except Empty:
                 pass
             return result

@@ -77,6 +77,13 @@ Change log
 
 Released: Not yet
 
+* Separate GnuPG's machine-readable ``[GNUPG:]`` status channel from human-readable
+  diagnostics. Result objects now provide ``status_lines`` and ``status_records``;
+  ``stderr`` and the new ``diagnostics`` alias contain diagnostics only. POSIX uses an
+  inherited status file descriptor (CPython 3.2+ ``pass_fds``; Python 2.7 falls back to
+  ``close_fds=False``), while native Windows uses ``--status-file`` when available and
+  otherwise falls back to legacy stderr classification.
+
 0.5.7
 -----
 

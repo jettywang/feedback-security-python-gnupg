@@ -1223,6 +1223,217 @@ class GPGTestCase(unittest.TestCase):
         args = self.gpg.make_args(['a', 'b'], False)
         self.assertTrue(len(args) > 4)
         self.assertEqual(args[-4:], ['--foo', '--bar', 'a', 'b'])
+        args = self.gpg.make_args(['a', 'b'], True, status_fd=3)
+        self.assertEqual(args[:3], [GPGBINARY, '--status-fd', '3'])
+        self.assertIn('--pinentry-mode', args)
+        self.assertEqual('loopback', args[args.index('--pinentry-mode') + 1])
+        args = self.gpg.make_args(['a', 'b'], False, status_file='status.log')
+        self.assertEqual(args[:3], [GPGBINARY, '--status-file', 'status.log'])
+        args = self.gpg.make_args(['a', 'b'], False)
+        self.assertEqual(args[:3], [GPGBINARY, '--status-fd', '2'])
+
+    def make_fake_gpg(self, early_exit=False):
+        "Create a POSIX executable which keeps diagnostics and status on separate channels"
+        fd, fn = tempfile.mkstemp(prefix='fake-gpg-')
+        os.close(fd)
+        script = r'''#! /bin/sh
+is_verify=0
+for arg in "$@"; do
+  if [ "$arg" = "--verify" ]; then
+    is_verify=1
+  fi
+done
+if [ "$1" = "--dump-options" ]; then
+  echo --status-fd
+  echo --status-file
+  exit 0
+fi
+if [ "$1" = "--list-config" ]; then
+  echo 'cfg:version:2.5.24'
+  exit 0
+fi
+status_fd=2
+status_file=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --status-fd)
+      status_fd=$2
+      shift 2
+      ;;
+    --status-file)
+      status_file=$2
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+write_status() {
+  if [ -n "$status_file" ]; then
+    printf '%s\n' "$1" >> "$status_file"
+  else
+    printf '%s\n' "$1" >&$status_fd
+  fi
+}
+echo 'fake gpg diagnostic before status' >&2
+echo '[GNUPG:] BADSIG FAKE diagnostic-looking status on stderr' >&2
+echo 'fake gpg stdout payload'
+write_status '[GNUPG:] NEWSIG'
+write_status '[GNUPG:] SIG_ID fake-sig 1234567890 1234567890'
+write_status '[GNUPG:] GOODSIG DEADBEEFDEADBEEF Test User'
+write_status '[GNUPG:] VALIDSIG 111111111111111111111111DEADBEEFDEADBEEF 20260101 1234567890 0 1 2 0 0 1 ' \
+  '222222222222222222222222DEADBEEFDEADBEEF'
+if [ "$FAKE_GPG_EARLY_EXIT" = "1" ] && [ "$is_verify" = "1" ]; then
+  dd of=/dev/null bs=1 count=1 2>/dev/null
+  exit 7
+fi
+write_status '[GNUPG:] TRUST_FULLY'
+if [ -n "$status_file" ]; then
+  printf '[GNUPG:] %s' 'diagnostic-marker' >> "$status_file"
+else
+  printf '[GNUPG:] %s' 'diagnostic-marker' >&$status_fd
+fi
+echo 'fake gpg diagnostic after status' >&2
+exit 0
+'''
+        with open(fn, 'w') as f:
+            f.write(script)
+        os.chmod(fn, stat.S_IRWXU)
+        if early_exit:
+            os.environ['FAKE_GPG_EARLY_EXIT'] = '1'
+        else:
+            os.environ.pop('FAKE_GPG_EARLY_EXIT', None)
+        return fn
+
+    def remove_fake_gpg(self, fn):
+        "Remove a fake gpg executable"
+        os.remove(fn)
+        os.environ.pop('FAKE_GPG_EARLY_EXIT', None)
+
+    def assert_status_channels(self, gpg, result, early_exit=False):
+        "Check that stdout, diagnostics and status each retain their own data"
+        self.assertIn('fake gpg stdout payload', result.data.decode(gpg.encoding))
+        self.assertIn('fake gpg diagnostic before status', result.stderr)
+        self.assertIn('[GNUPG:] BADSIG FAKE diagnostic-looking status on stderr', result.stderr)
+        self.assertEqual(result.stderr, result.diagnostics)
+        self.assertNotIn('[GNUPG:] GOODSIG', result.stderr)
+        self.assertIn('[GNUPG:] GOODSIG', result.status_lines)
+        self.assertIn(('GOODSIG', 'DEADBEEFDEADBEEF Test User'), result.status_records)
+        self.assertTrue(result.valid)
+        self.assertEqual('signature valid', result.status)
+        self.assertEqual('DEADBEEFDEADBEEF', result.key_id)
+        self.assertNotIn('BADSIG', [record[0] for record in result.status_records])
+        if not early_exit:
+            self.assertTrue(result.status_lines.endswith('diagnostic-marker'))
+            self.assertFalse(result.status_lines.endswith('\n'))
+        if early_exit:
+            self.assertEqual(7, result.returncode)
+
+    def test_separate_status_channel_with_fake_gpg(self):
+        "Fake status text on stderr stays diagnostic and does not determine the signature"
+        if os.name != 'posix':
+            raise unittest.SkipTest('Fake executable and inherited fd test requires POSIX')
+        fn = self.make_fake_gpg()
+        try:
+            gpg = gnupg.GPG(gnupghome=self.homedir, gpgbinary=fn, status_channel='fd')
+            self.assertEqual('fd', gpg.status_channel)
+            result = gpg.verify('signed data')
+            self.assert_status_channels(gpg, result)
+        finally:
+            self.remove_fake_gpg(fn)
+
+    def test_separate_status_file_channel_with_fake_gpg(self):
+        "A status file also keeps fake status-prefixed diagnostics out of status parsing"
+        if os.name != 'posix':
+            raise unittest.SkipTest('Shell fake executable requires POSIX')
+        fn = self.make_fake_gpg()
+        try:
+            gpg = gnupg.GPG(gnupghome=self.homedir, gpgbinary=fn, status_channel='file')
+            result = gpg.verify('signed data')
+            self.assert_status_channels(gpg, result)
+        finally:
+            self.remove_fake_gpg(fn)
+
+    def test_status_channel_early_exit(self):
+        "Early gpg termination still drains stdout, diagnostics and the status channel"
+        if os.name != 'posix':
+            raise unittest.SkipTest('Shell fake executable requires POSIX')
+        channels = ('fd', 'file')
+        fn = self.make_fake_gpg(early_exit=True)
+        try:
+            for channel in channels:
+                gpg = gnupg.GPG(gnupghome=self.homedir, gpgbinary=fn, status_channel=channel)
+                result = gpg.verify(b'x' * (20 * gpg.buffer_size))
+                self.assert_status_channels(gpg, result, early_exit=True)
+        finally:
+            self.remove_fake_gpg(fn)
+
+    def test_legacy_status_channel(self):
+        "The stderr fallback remains available where a separate channel cannot be used"
+        gpg = gnupg.GPG(gnupghome=self.homedir, gpgbinary=GPGBINARY, status_channel='stderr')
+        result = gpg.verify('not a signature')
+        self.assertNotEqual(0, result.returncode, 'A zero return code was not expected')
+        self.assertNotIn('[GNUPG:]', result.stderr)
+        self.assertIn('[GNUPG:]', result.status_lines)
+        self.assertTrue(result.status_records)
+
+    def test_invalid_status_channel(self):
+        "An unknown status channel is rejected before gpg is started"
+        with self.assertRaises(ValueError):
+            gnupg.GPG(gnupghome=self.homedir, gpgbinary=GPGBINARY, status_channel='socket')
+        if not gnupg.HAS_STATUS_FD:
+            with self.assertRaises(ValueError):
+                gnupg.GPG(gnupghome=self.homedir, gpgbinary=GPGBINARY, status_channel='fd')
+
+    def test_status_fd_is_inherited(self):
+        "The dedicated POSIX status descriptor is the only extra descriptor passed to gpg"
+        if os.name != 'posix':
+            raise unittest.SkipTest('pass_fds requires POSIX')
+        calls = []
+        original_popen = gnupg.Popen
+
+        class FakeProcess(object):
+            pid = -1
+
+            def __init__(self, cmd, **kwargs):
+                calls.append((cmd, kwargs))
+                self.stdin = io.BytesIO(b'')
+                self.stdout = io.BytesIO(b'')
+                self.stderr = io.BytesIO(b'')
+                self.returncode = 0
+
+        gnupg.Popen = FakeProcess
+        try:
+            process = self.gpg._open_subprocess(['--version'])
+            try:
+                cmd, kwargs = calls[-1]
+                self.assertEqual('--status-fd', cmd[1])
+                status_fd = int(cmd[2])
+                self.assertEqual((status_fd, ), kwargs.get('pass_fds'))
+                self.assertTrue(status_fd > 2)
+                self.assertEqual(None, kwargs.get('close_fds'))
+            finally:
+                process.stdin.close()
+                process.stdout.close()
+                process.stderr.close()
+                os.close(process.status_input)
+        finally:
+            gnupg.Popen = original_popen
+
+    def test_unsupported_status_file_fallback(self):
+        "Automatic file-channel selection falls back instead of failing initialization"
+        original_supports = gnupg.GPG._supports_status_file
+        gnupg.GPG._supports_status_file = lambda self: False
+        try:
+            gpg = gnupg.GPG(gnupghome=self.homedir, gpgbinary=GPGBINARY, status_channel='file')
+            expected = 'fd' if gnupg.HAS_STATUS_FD else 'stderr'
+            self.assertEqual(expected, gpg.status_channel)
+            if not gnupg.HAS_STATUS_FD:
+                with self.assertRaises(ValueError):
+                    gnupg.GPG(gnupghome=self.homedir, gpgbinary=GPGBINARY)
+        finally:
+            gnupg.GPG._supports_status_file = original_supports
 
     def do_file_encryption_and_decryption(self, encfname, decfname):
         "Do the actual encryption/decryption test using given filenames"
