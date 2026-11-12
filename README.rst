@@ -77,6 +77,16 @@ Change log
 
 Released: Not yet
 
+* Added ``import_keys_controlled()`` and ``import_keys_file_controlled()``,
+  which import public keys only when every primary key in the candidate data
+  has a full fingerprint in a caller-supplied approved set. The candidate
+  data is first inspected in an isolated temporary GnuPG home directory, and
+  a report of primary keys, subkeys and observable updates is returned.
+  Secret key material, unapproved primary keys, unconfirmable fingerprints
+  and corrupt data are rejected without touching the keyring, and local
+  ownertrust is preserved. An ``allowed_fingerprints`` keyword argument was
+  also added to ``import_keys()`` and ``import_keys_file()``.
+
 0.5.7
 -----
 

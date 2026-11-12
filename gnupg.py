@@ -528,6 +528,123 @@ class ImportResult(StatusHandler):
         return ', '.join(result)
 
 
+# Full fingerprints only: 32 hex chars (v3), 40 (v4) or 64 (v5). Short or
+# long key IDs are never acceptable where a fingerprint is required.
+_FULL_FINGERPRINT_RE = re.compile(r'^(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})$', re.I)
+
+# Messages written by gpg to stderr when key material can't be fully parsed.
+# These indicate truncated or otherwise corrupt key data (a "mid-way" error),
+# as opposed to keys which are merely unusable.
+_IMPORT_DATA_ERROR_RE = re.compile(r'invalid packet|read error|no valid OpenPGP data|'
+                                   r'invalid keyring|import from .* failed|premature end|'
+                                   r'truncated', re.I)
+
+
+def _normalize_fingerprint(fp):
+    """
+    Normalize a full fingerprint to uppercase hex, tolerating a ``0x`` prefix
+    and embedded spaces. Anything which isn't a full fingerprint (e.g. a key
+    ID) is rejected with a ``ValueError``.
+    """
+    if not isinstance(fp, string_types):
+        raise ValueError('Not a valid fingerprint: %r' % (fp, ))
+    s = fp.strip()
+    if s[:2].lower() == '0x':
+        s = s[2:]
+    s = s.replace(' ', '').upper()
+    if not _FULL_FINGERPRINT_RE.match(s):
+        raise ValueError('Not a full fingerprint: %r' % (fp, ))
+    return s
+
+
+def _is_full_fingerprint(fp):
+    "Return True if fp looks like a full fingerprint."
+    return bool(fp) and bool(_FULL_FINGERPRINT_RE.match(fp))
+
+
+def _contains_secret_key_material(key_data):
+    "Check armored key data for secret/secret-key blocks."
+    if isinstance(key_data, bytes):
+        return b'PRIVATE KEY BLOCK' in key_data or b'SECRET KEY BLOCK' in key_data
+    return 'PRIVATE KEY BLOCK' in key_data or 'SECRET KEY BLOCK' in key_data
+
+
+def _controlled_import_problem(import_result):
+    """
+    Examine an ImportResult for problems relating to the key *data* (as
+    opposed to environmental issues such as a missing agent). Returns a
+    ``(reason, message)`` tuple, or ``None`` if no problem was found.
+    """
+    stderr = import_result.stderr or ''
+    if _IMPORT_DATA_ERROR_RE.search(stderr):
+        return ('invalid-key-data', 'key data could not be fully parsed')
+    if import_result.sec_read or import_result.sec_imported:
+        return ('secret-material', 'key data contains secret key material')
+    if import_result.not_imported:
+        return ('invalid-key-data', '%d key(s) could not be imported' % import_result.not_imported)
+    for entry in import_result.results:
+        if 'ok' in entry and int(entry['ok']) & 16:
+            return ('secret-material', 'key data contains secret key material')
+        if entry.get('fingerprint') and 'problem' in entry:
+            return ('invalid-key-data',
+                    'key %s could not be imported: %s' % (entry['fingerprint'], entry.get('text')))
+    return None
+
+
+class ControlledImportResult(ImportResult):
+    """
+    The result of a fingerprint-controlled import (see
+    :meth:`GPG.import_keys_controlled`).
+
+    In addition to the usual :class:`ImportResult` attributes (which describe
+    the actual import, if one was performed), an instance of this class
+    carries a ``report`` dictionary describing the candidate key material and
+    the policy decision. Report entries can also be accessed as attributes
+    (e.g. ``result.primary_keys``) or as items (e.g. ``result['updates']``).
+    """
+
+    def __init__(self, gpg):
+        ImportResult.__init__(self, gpg)
+        self.report = {}
+        self.rejected = False
+        self.reason = None
+        self.errors = []
+        self.dry_run = False
+        self.status = 'pending'
+
+    def __nonzero__(self):
+        return not self.rejected and ImportResult.__nonzero__(self)
+
+    __bool__ = __nonzero__
+
+    def __getattr__(self, name):
+        # Only called when normal attribute lookup fails, so report entries
+        # can be read as attributes without shadowing real attributes.
+        try:
+            return self.__dict__['report'][name]
+        except KeyError:
+            raise AttributeError(name)
+
+    def __getitem__(self, key):
+        return self.report[key]
+
+    def __contains__(self, key):
+        return key in self.report
+
+    def get(self, key, default=None):
+        return self.report.get(key, default)
+
+    def summary(self):
+        """
+        Return a summary of the controlled import.
+        """
+        if self.rejected:
+            return 'rejected: %s' % (self.reason or 'unknown reason')
+        if self.dry_run:
+            return 'validated (dry run - nothing imported)'
+        return ImportResult.summary(self)
+
+
 ESCAPE_PATTERN = re.compile(r'\\x([0-9a-f][0-9a-f])', re.I)
 BASIC_ESCAPES = {
     r'\n': '\n',
@@ -1607,7 +1724,7 @@ class GPG(object):
     # KEY MANAGEMENT
     #
 
-    def import_keys(self, key_data, extra_args=None, passphrase=None):
+    def import_keys(self, key_data, extra_args=None, passphrase=None, allowed_fingerprints=None):
         """
         Import the key_data into our keyring.
 
@@ -1617,7 +1734,17 @@ class GPG(object):
             passphrase (str): The passphrase to use.
 
             extra_args (list[str]): Additional arguments to pass to `gpg`.
+
+            allowed_fingerprints (str|list[str]): If specified, the import is
+                delegated to :meth:`import_keys_controlled`, which only imports
+                public keys whose primary-key fingerprints are all in this
+                approved set.
         """
+        if allowed_fingerprints is not None:
+            return self.import_keys_controlled(key_data,
+                                               allowed_fingerprints,
+                                               extra_args=extra_args,
+                                               passphrase=passphrase)
         result = self.result_map['import'](self)
         logger.debug('import_keys: %r', key_data[:256])
         data = _make_binary_stream(key_data, self.encoding)
@@ -1638,6 +1765,343 @@ class GPG(object):
         """
         with open(key_path, 'rb') as f:
             return self.import_keys(f.read(), **kwargs)
+
+    # Filenames (relative to the GnuPG home directory) which hold the public
+    # keyring and the local ownertrust. Snapshotted before a controlled
+    # import so that a failed import can be rolled back.
+    _KEYRING_BASENAMES = ('pubring.kbx', 'pubring.kbx~', 'pubring.gpg', 'pubring.gpg~', 'trustdb.gpg')
+
+    def _snapshot_keyring_files(self):
+        """
+        Return a dict mapping keyring-related file paths to their current
+        contents (or ``None`` if the file doesn't exist). Best-effort: only
+        files which can be located are included.
+        """
+        paths = []
+        if self.gnupghome:
+            for name in self._KEYRING_BASENAMES:
+                paths.append(os.path.join(self.gnupghome, name))
+            # Used by keyboxd (GnuPG >= 2.3) if enabled.
+            pkd = os.path.join(self.gnupghome, 'public-keys.d')
+            if os.path.isdir(pkd):  # pragma: no cover
+                for name in sorted(os.listdir(pkd)):
+                    path = os.path.join(pkd, name)
+                    if os.path.isfile(path):
+                        paths.append(path)
+        if self.keyring:
+            for fn in self.keyring:
+                paths.extend([fn, fn + '~'])
+        snapshot = {}
+        for path in paths:
+            try:
+                with open(path, 'rb') as f:
+                    snapshot[path] = f.read()
+            except IOError:
+                snapshot[path] = None
+        return snapshot
+
+    def _restore_keyring_files(self, snapshot):
+        """
+        Restore keyring-related files from a snapshot made by
+        :meth:`_snapshot_keyring_files`. Best-effort: failures are logged
+        rather than raised.
+        """
+        for path, content in snapshot.items():
+            try:
+                if content is None:
+                    if os.path.exists(path):
+                        os.remove(path)
+                else:
+                    with open(path, 'wb') as f:
+                        f.write(content)
+            except IOError:  # pragma: no cover
+                logger.warning('unable to restore %s', path)
+
+    def import_keys_controlled(self,
+                               key_data,
+                               allowed_fingerprints,
+                               extra_args=None,
+                               passphrase=None,
+                               dry_run=False,
+                               allow_updates=True):
+        """
+        Import public keys from ``key_data`` only if every primary key in it
+        has a full fingerprint in ``allowed_fingerprints``.
+
+        The candidate material is first read in an isolated, temporary GnuPG
+        home directory, so nothing in this instance's keyring is touched
+        while the data is examined. A :class:`ControlledImportResult` is
+        returned whose ``report`` describes the primary keys, subkeys and
+        observable updates (new keys, user IDs, signatures and subkeys)
+        relative to the current keyring.
+
+        The import is rejected (``result.rejected`` is true and the keyring
+        is left unchanged) if the key data:
+
+        * contains secret key material (``'secret-material'``),
+        * contains primary keys whose fingerprints are not in
+          ``allowed_fingerprints`` (``'extra-primary-key'``),
+        * contains keys whose full fingerprints cannot be determined
+          (``'unconfirmable-fingerprint'``),
+        * is truncated or otherwise not fully parseable
+          (``'invalid-key-data'``), or
+        * would update keys already in the keyring and ``allow_updates`` is
+          false (``'already-exists'``).
+
+        Keys which are already present in the keyring are treated as updates:
+        new user IDs, signatures and subkeys are merged by `gpg`, and an
+        unchanged key is a no-op. Local ownertrust is never modified by the
+        import - ownertrust values are recorded before and checked after the
+        import, and any unexpected change causes a rollback and rejection.
+
+        Args:
+            key_data (str|bytes): The candidate key data.
+
+            allowed_fingerprints (str|list[str]): The approved set of full
+                primary-key fingerprints.
+
+            extra_args (list[str]): Additional arguments to pass to `gpg`.
+
+            passphrase (str): The passphrase to use.
+
+            dry_run (bool): If true, only validate and report - the keyring
+                is never modified.
+
+            allow_updates (bool): Whether candidate keys which are already
+                present in the keyring are allowed.
+
+        Returns:
+            ControlledImportResult: The result of the validation and, unless
+            rejected or a dry run, of the actual import.
+        """
+        import shutil
+        import tempfile
+
+        if isinstance(allowed_fingerprints, string_types):
+            allowed_fingerprints = [allowed_fingerprints]
+        allowed = [_normalize_fingerprint(fp) for fp in allowed_fingerprints]
+        allowed_set = set(allowed)
+
+        result = ControlledImportResult(self)
+        result.dry_run = bool(dry_run)
+        report = result.report
+        report.update({
+            'allowed_fingerprints': allowed,
+            'dry_run': bool(dry_run),
+            'primary_keys': [],
+            'subkeys': [],
+            'updates': [],
+            'update_summary': {},
+            'existing_fingerprints': [],
+            'new_fingerprints': [],
+            'extra_primary_fingerprints': [],
+            'unconfirmed_fingerprints': [],
+            'secret_material': False,
+            'ownertrust_preserved': True,
+        })
+
+        # Snapshot the current state of the target keyring, so that we can
+        # report on it and verify that a rejected import changed nothing.
+        before_keys = self.list_keys()
+        target_before = list(before_keys.fingerprints)
+        target_before_set = set(target_before)
+        ownertrust_before = {}
+        for key in before_keys:
+            ownertrust_before[key['fingerprint']] = key.get('ownertrust')
+        secret_before = set(self.list_keys(secret=True).fingerprints)
+        report['target_fingerprints_before'] = target_before
+        report['target_fingerprints_after'] = list(target_before)
+        report['ownertrust_before'] = ownertrust_before
+        report['ownertrust_after'] = dict(ownertrust_before)
+
+        def finalize(status):
+            result.status = status
+            report['status'] = status
+            report['rejected'] = result.rejected
+            report['reason'] = result.reason
+            report['errors'] = list(result.errors)
+            return result
+
+        def reject(reason, message):
+            result.rejected = True
+            result.reason = reason
+            if message not in result.errors:
+                result.errors.append(message)
+            logger.debug('controlled import rejected: %s: %s', reason, message)
+            return finalize('rejected')
+
+        isolated_home = tempfile.mkdtemp(prefix='pygpg-controlled-')
+        try:
+            os.chmod(isolated_home, 0o700)
+            isolated = GPG(gpgbinary=self.gpgbinary, gnupghome=isolated_home, encoding=self.encoding)
+            scan = isolated.scan_keys_mem(key_data)
+
+            # Reject secret key material - only public keys may be imported.
+            secret_material = _contains_secret_key_material(key_data)
+            primary_records = []
+            for record in scan:
+                if record.get('type') in ('sec', 'ssb'):
+                    secret_material = True
+                else:
+                    primary_records.append(record)
+            report['secret_material'] = secret_material
+            if secret_material:
+                return reject('secret-material', 'key data contains secret key material')
+            if not primary_records:
+                return reject('invalid-key-data', 'no public key material found in key data')
+            if scan.returncode or _IMPORT_DATA_ERROR_RE.search(scan.stderr or ''):
+                return reject('invalid-key-data', 'key data could not be fully parsed')
+
+            primary_keys = []
+            subkey_report = []
+            unconfirmed = []
+            for record in primary_records:
+                fp = record.get('fingerprint')
+                if not _is_full_fingerprint(fp):
+                    unconfirmed.append(record.get('keyid') or '<unknown>')
+                subkeys = []
+                for keyid, capability, sub_fp, _grip in record.get('subkeys', []):
+                    if not _is_full_fingerprint(sub_fp):
+                        unconfirmed.append(keyid or '<unknown>')
+                    subkey = {'keyid': keyid, 'capabilities': capability, 'fingerprint': sub_fp}
+                    subkeys.append(subkey)
+                    entry = dict(subkey)
+                    entry['primary_fingerprint'] = fp
+                    subkey_report.append(entry)
+                primary_keys.append({
+                    'fingerprint': fp,
+                    'keyid': record.get('keyid'),
+                    'uids': list(record.get('uids', [])),
+                    'subkeys': subkeys,
+                })
+            report['primary_keys'] = primary_keys
+            report['subkeys'] = subkey_report
+            report['unconfirmed_fingerprints'] = unconfirmed
+            if unconfirmed:
+                return reject('unconfirmable-fingerprint',
+                              'unable to confirm fingerprints for: %s' % ', '.join(unconfirmed))
+
+            primary_fps = []
+            for pk in primary_keys:
+                if pk['fingerprint'] not in primary_fps:
+                    primary_fps.append(pk['fingerprint'])
+            extra = [fp for fp in primary_fps if fp not in allowed_set]
+            report['extra_primary_fingerprints'] = extra
+            if extra:
+                return reject('extra-primary-key',
+                              'key data contains unapproved primary keys: %s' % ', '.join(extra))
+
+            existing = [fp for fp in primary_fps if fp in target_before_set]
+            report['existing_fingerprints'] = existing
+            report['new_fingerprints'] = [fp for fp in primary_fps if fp not in target_before_set]
+            if existing and not allow_updates:
+                return reject('already-exists',
+                              'key data would update keys already in the keyring: %s' % ', '.join(existing))
+
+            # Observe what the import would change, in the isolated home
+            # pre-populated with the current contents of the target keyring.
+            if target_before:
+                exported = self.export_keys(target_before)
+                if exported:
+                    isolated.import_keys(exported)
+            isolated_result = isolated.import_keys(key_data)
+            problem = _controlled_import_problem(isolated_result)
+            if problem:
+                return reject(*problem)
+
+            updates = []
+            for entry in isolated_result.results:
+                if 'ok' not in entry:
+                    continue
+                bits = int(entry['ok'])
+                updates.append({
+                    'fingerprint': entry['fingerprint'],
+                    'new_key': bool(bits & 1),
+                    'new_user_ids': bool(bits & 2),
+                    'new_signatures': bool(bits & 4),
+                    'new_subkeys': bool(bits & 8),
+                    'contains_private_key': bool(bits & 16),
+                    'unchanged': not bits,
+                })
+            report['updates'] = updates
+            report['update_summary'] = {
+                'imported': isolated_result.imported,
+                'unchanged': isolated_result.unchanged,
+                'new_user_ids': isolated_result.n_uids,
+                'new_subkeys': isolated_result.n_subk,
+                'new_signatures': isolated_result.n_sigs,
+            }
+
+            if dry_run:
+                return finalize('validated')
+
+            # Everything checked out - do the actual import, with a snapshot
+            # to roll back to if anything unexpected happens.
+            snapshot = self._snapshot_keyring_files()
+            data = _make_binary_stream(key_data, self.encoding)
+            args = ['--import']
+            if extra_args:  # pragma: no cover
+                args.extend(extra_args)
+            try:
+                self._handle_io(args, data, result, passphrase=passphrase, binary=True)
+            finally:
+                data.close()
+
+            after_keys = self.list_keys()
+            target_after = list(after_keys.fingerprints)
+            target_after_set = set(target_after)
+            ownertrust_after = {}
+            for key in after_keys:
+                ownertrust_after[key['fingerprint']] = key.get('ownertrust')
+            secret_after = set(self.list_keys(secret=True).fingerprints)
+            report['target_fingerprints_after'] = target_after
+            report['ownertrust_after'] = ownertrust_after
+
+            def rollback(reason, message):
+                self._restore_keyring_files(snapshot)
+                report['target_fingerprints_after'] = list(target_before)
+                report['ownertrust_after'] = dict(ownertrust_before)
+                report['ownertrust_preserved'] = True
+                return reject(reason, message)
+
+            problem = _controlled_import_problem(result)
+            if problem:
+                return rollback(*problem)
+            unexpected = target_after_set - target_before_set - set(primary_fps)
+            if unexpected:  # pragma: no cover
+                return rollback('import-failed',
+                                'unexpected keys appeared in the keyring: %s' % ', '.join(sorted(unexpected)))
+            missing = [fp for fp in primary_fps if fp not in target_after_set]
+            if missing:
+                return rollback('import-failed',
+                                'approved keys were not imported: %s' % ', '.join(missing))
+            if secret_after != secret_before:  # pragma: no cover
+                return rollback('secret-material', 'secret keys appeared in the keyring')
+            preserved = all(ownertrust_after.get(fp) == trust for fp, trust in ownertrust_before.items())
+            report['ownertrust_preserved'] = preserved
+            if not preserved:  # pragma: no cover
+                return rollback('ownertrust-changed', 'local ownertrust values changed during import')
+            if result.imported or result.n_uids or result.n_subk or result.n_sigs:
+                status = 'imported'
+            else:
+                status = 'unchanged'
+            return finalize(status)
+        finally:
+            shutil.rmtree(isolated_home, ignore_errors=True)
+
+    def import_keys_file_controlled(self, key_path, allowed_fingerprints, **kwargs):
+        """
+        Import the key data in ``key_path`` under fingerprint control, as for
+        :meth:`import_keys_controlled`.
+
+        Args:
+            key_path (str): A path to the key data to be imported.
+
+            allowed_fingerprints (str|list[str]): The approved set of full
+                primary-key fingerprints.
+        """
+        with open(key_path, 'rb') as f:
+            return self.import_keys_controlled(f.read(), allowed_fingerprints, **kwargs)
 
     def recv_keys(self, keyserver, *keyids, **kwargs):
         """

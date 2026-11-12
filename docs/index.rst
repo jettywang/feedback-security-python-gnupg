@@ -542,6 +542,62 @@ This also takes the keyword arguments specified for :meth:`~gnupg.GPG.import_key
 .. versionadded:: 0.5.0
    The :meth:`~gnupg.GPG.import_keys_file` method.
 
+Fingerprint-controlled imports
+------------------------------
+
+Key files received from external sources may contain multiple keys, and you
+may only want to import a specific, approved set of them. You can do this
+with :meth:`~gnupg.GPG.import_keys_controlled`, passing the approved set of
+full primary-key fingerprints::
+
+    >>> result = gpg.import_keys_controlled(key_data, allowed_fingerprints)
+
+The candidate key data is first read in an isolated, temporary GnuPG home
+directory, so your keyring is never touched while the data is being examined.
+The returned :class:`~gnupg.ControlledImportResult` has a ``report``
+dictionary (whose entries can also be read as attributes) describing what was
+found: the primary keys, their subkeys and the observable updates (new keys,
+user IDs, signatures and subkeys) relative to your current keyring. To see
+this report without importing anything, pass ``dry_run=True``::
+
+    >>> preview = gpg.import_keys_controlled(key_data, allowed_fingerprints, dry_run=True)
+    >>> preview.primary_keys
+    >>> preview.updates
+
+The import is rejected - ``result.rejected`` is true, ``result.reason`` says
+why, and the keyring is left exactly as it was - if the key data:
+
+* contains secret key material (``'secret-material'``),
+* contains primary keys whose fingerprints are not in ``allowed_fingerprints``
+  (``'extra-primary-key'``),
+* contains keys whose full fingerprints cannot be determined
+  (``'unconfirmable-fingerprint'``),
+* is truncated or otherwise not fully parseable (``'invalid-key-data'``), or
+* would update keys already in the keyring, when ``allow_updates=False`` is
+  passed (``'already-exists'``).
+
+Keys which are already present in the keyring are treated as updates: new
+user IDs, signatures and subkeys are merged by ``gpg``, and re-importing an
+unchanged key is a no-op. Local ownertrust is never modified by a controlled
+import: ownertrust values are recorded before and checked after the import,
+and any unexpected change causes the keyring to be rolled back and the import
+to be rejected.
+
+To import from a file under fingerprint control, use
+:meth:`~gnupg.GPG.import_keys_file_controlled`::
+
+    >>> result = gpg.import_keys_file_controlled(key_path, allowed_fingerprints)
+
+You can also pass ``allowed_fingerprints`` to :meth:`~gnupg.GPG.import_keys`
+or :meth:`~gnupg.GPG.import_keys_file`, which then delegate to
+:meth:`~gnupg.GPG.import_keys_controlled`.
+
+.. versionadded:: 0.5.8
+   The :meth:`~gnupg.GPG.import_keys_controlled` and
+   :meth:`~gnupg.GPG.import_keys_file_controlled` methods, and the
+   ``allowed_fingerprints`` keyword argument to
+   :meth:`~gnupg.GPG.import_keys`.
+
 To receive keys from a keyserver, use :meth:`~gnupg.GPG.recv_keys`::
 
     >>> import_result = gpg.recv_keys('server-name', 'keyid1', 'keyid2', ...)

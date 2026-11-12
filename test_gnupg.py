@@ -1026,6 +1026,154 @@ class GPGTestCase(unittest.TestCase):
             logger.debug('now: %r', ascii)
         self.assertEqual(0, match, 'Keys must match')
 
+    def controlled_allowed_fingerprints(self, key_data=KEYS_TO_IMPORT):
+        "Return the full primary fingerprints of the keys in key_data"
+        # Note: no return code check - scanning secret keys can make gpg
+        # return a non-zero code when no agent is available.
+        return self.gpg.scan_keys_mem(key_data).fingerprints
+
+    def test_controlled_import(self):
+        "Test that fingerprint-controlled import validates, reports and imports"
+        gpg = self.gpg
+        allowed = self.controlled_allowed_fingerprints()
+        self.assertEqual(2, len(allowed), '2 fingerprints expected')
+        # A dry run validates and reports, but doesn't touch the keyring
+        preview = gpg.import_keys_controlled(KEYS_TO_IMPORT, allowed, dry_run=True)
+        self.assertFalse(preview.rejected, 'Should not be rejected')
+        self.assertFalse(preview.secret_material, 'No secret material expected')
+        self.assertEqual('validated', preview.status)
+        self.assertEqual(sorted(allowed), sorted(preview['allowed_fingerprints']))
+        primary_fps = [k['fingerprint'] for k in preview.primary_keys]
+        self.assertEqual(sorted(allowed), sorted(primary_fps))
+        for key in preview.primary_keys:
+            self.assertTrue(key['uids'], 'Each primary key should have user IDs')
+            self.assertTrue(key['subkeys'], 'Each primary key should have subkeys')
+        self.assertEqual(2, len(preview.subkeys), '2 subkeys expected')
+        for subkey in preview.subkeys:
+            self.assertIn(subkey['primary_fingerprint'], allowed)
+        self.assertEqual(sorted(allowed), sorted(preview.new_fingerprints))
+        self.assertEqual([], preview.existing_fingerprints)
+        self.assertTrue(all(u['new_key'] for u in preview.updates))
+        self.assertEqual([], gpg.list_keys().fingerprints, 'Dry run must not import')
+        # Now the actual import
+        result = gpg.import_keys_controlled(KEYS_TO_IMPORT, allowed)
+        self.assertFalse(result.rejected, 'Should not be rejected')
+        self.assertEqual('imported', result.status)
+        self.assertEqual(sorted(allowed), sorted(result.fingerprints))
+        self.assertEqual([], result.target_fingerprints_before)
+        self.assertEqual(sorted(allowed), sorted(result.target_fingerprints_after))
+        self.assertEqual(sorted(allowed), sorted(gpg.list_keys().fingerprints))
+        self.assertTrue(result.ownertrust_preserved)
+        self.assertEqual(0, len(gpg.list_keys(secret=True)), 'No secret keys expected')
+
+    def test_controlled_import_rejects_extra_primary(self):
+        "Test that unapproved primary keys in a bundle are rejected atomically"
+        gpg = self.gpg
+        allowed = self.controlled_allowed_fingerprints()
+        signed_fps = self.controlled_allowed_fingerprints(SIGNED_KEYS)
+        before = gpg.list_keys().fingerprints
+        # Only one of the two keys in the bundle is approved
+        result = gpg.import_keys_controlled(KEYS_TO_IMPORT, allowed[:1])
+        self.assertTrue(result.rejected, 'Should be rejected')
+        self.assertEqual('extra-primary-key', result.reason)
+        self.assertEqual([allowed[1]], result.extra_primary_fingerprints)
+        self.assertEqual(before, gpg.list_keys().fingerprints, 'Keyring must be unchanged')
+        self.assertEqual(before, result.target_fingerprints_after)
+        # A mixed bundle with entirely unapproved keys is also rejected
+        mixed = KEYS_TO_IMPORT + '\n' + SIGNED_KEYS
+        result = gpg.import_keys_controlled(mixed, allowed)
+        self.assertTrue(result.rejected, 'Should be rejected')
+        self.assertEqual('extra-primary-key', result.reason)
+        self.assertEqual(sorted(signed_fps), sorted(result.extra_primary_fingerprints))
+        self.assertEqual(before, gpg.list_keys().fingerprints, 'Keyring must be unchanged')
+
+    def test_controlled_import_rejects_secret_material(self):
+        "Test that secret key material is rejected, even alongside approved keys"
+        gpg = self.gpg
+        allowed = self.controlled_allowed_fingerprints()
+        secret_fps = self.controlled_allowed_fingerprints(SECRET_KEY)
+        before = gpg.list_keys().fingerprints
+        result = gpg.import_keys_controlled(SECRET_KEY, secret_fps)
+        self.assertTrue(result.rejected, 'Should be rejected')
+        self.assertEqual('secret-material', result.reason)
+        self.assertTrue(result.secret_material)
+        self.assertEqual(before, gpg.list_keys().fingerprints, 'Keyring must be unchanged')
+        # A mix of approved public keys and secret material is also rejected
+        mixed = KEYS_TO_IMPORT + '\n' + SECRET_KEY
+        result = gpg.import_keys_controlled(mixed, allowed + secret_fps)
+        self.assertTrue(result.rejected, 'Should be rejected')
+        self.assertEqual('secret-material', result.reason)
+        self.assertEqual(before, gpg.list_keys().fingerprints, 'Keyring must be unchanged')
+        self.assertEqual(0, len(gpg.list_keys(secret=True)), 'No secret keys expected')
+
+    def test_controlled_import_rejects_bad_data(self):
+        "Test that corrupt key data and unconfirmable fingerprints are rejected"
+        gpg = self.gpg
+        allowed = self.controlled_allowed_fingerprints()
+        before = gpg.list_keys().fingerprints
+        # No valid key material at all
+        result = gpg.import_keys_controlled('GARBAGE', allowed)
+        self.assertTrue(result.rejected, 'Should be rejected')
+        self.assertEqual('invalid-key-data', result.reason)
+        # A valid key followed by a truncated key (a mid-way error)
+        truncated = KEYS_TO_IMPORT + '\n-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nAAAA\n'
+        result = gpg.import_keys_controlled(truncated, allowed)
+        self.assertTrue(result.rejected, 'Should be rejected')
+        self.assertEqual('invalid-key-data', result.reason)
+        self.assertEqual(before, gpg.list_keys().fingerprints, 'Keyring must be unchanged')
+        # Approved fingerprints must be full fingerprints, not key IDs
+        self.assertRaises(ValueError, gpg.import_keys_controlled, KEYS_TO_IMPORT, ['967612475CED2E14'])
+        self.assertRaises(ValueError, gpg.import_keys_controlled, KEYS_TO_IMPORT, ['not-a-fingerprint'])
+        self.assertEqual(before, gpg.list_keys().fingerprints, 'Keyring must be unchanged')
+
+    def test_controlled_import_existing_keys_and_ownertrust(self):
+        "Test that existing keys are updated in place and ownertrust is preserved"
+        gpg = self.gpg
+        allowed = self.controlled_allowed_fingerprints()
+        gpg.import_keys(KEYS_TO_IMPORT)
+        gpg.trust_keys(allowed, 'TRUST_FULLY')
+        before = gpg.list_keys().fingerprints
+        self.assertEqual(sorted(allowed), sorted(before))
+        # Re-importing the same keys is a no-op which preserves ownertrust
+        result = gpg.import_keys_controlled(KEYS_TO_IMPORT, allowed)
+        self.assertFalse(result.rejected, 'Should not be rejected')
+        self.assertEqual('unchanged', result.status)
+        self.assertEqual(sorted(allowed), sorted(result.existing_fingerprints))
+        self.assertEqual([], result.new_fingerprints)
+        self.assertTrue(all(u['unchanged'] for u in result.updates))
+        self.assertTrue(result.ownertrust_preserved)
+        self.assertEqual(before, gpg.list_keys().fingerprints, 'Keyring must be unchanged')
+        for key in gpg.list_keys():
+            self.assertEqual('f', key['ownertrust'], 'Ownertrust must be preserved')
+        # Updates to existing keys can be forbidden
+        result = gpg.import_keys_controlled(KEYS_TO_IMPORT, allowed, allow_updates=False)
+        self.assertTrue(result.rejected, 'Should be rejected')
+        self.assertEqual('already-exists', result.reason)
+        self.assertEqual(before, gpg.list_keys().fingerprints, 'Keyring must be unchanged')
+
+    def test_controlled_import_file(self):
+        "Test fingerprint-controlled import from a file"
+        gpg = self.gpg
+        allowed = self.controlled_allowed_fingerprints()
+        fd, fn = tempfile.mkstemp(prefix='pygpg-test-')
+        try:
+            os.write(fd, KEYS_TO_IMPORT.encode('ascii'))
+            os.close(fd)
+            result = gpg.import_keys_file_controlled(fn, allowed)
+            self.assertFalse(result.rejected, 'Should not be rejected')
+            self.assertEqual(sorted(allowed), sorted(gpg.list_keys().fingerprints))
+        finally:
+            os.remove(fn)
+        # The allowed_fingerprints keyword also works via import_keys
+        gpg2 = gnupg.GPG(gnupghome=tempfile.mkdtemp(prefix='keys-'))
+        prepare_homedir(gpg2.gnupghome)
+        try:
+            result = gpg2.import_keys(KEYS_TO_IMPORT, allowed_fingerprints=allowed)
+            self.assertFalse(result.rejected, 'Should not be rejected')
+            self.assertEqual(sorted(allowed), sorted(gpg2.list_keys().fingerprints))
+        finally:
+            shutil.rmtree(gpg2.gnupghome, ignore_errors=True)
+
     def test_signature_verification(self):
         "Test that signing and verification works"
         key = self.generate_key('Andrew', 'Able', 'alpha.com')
@@ -1735,7 +1883,12 @@ TEST_GROUPS = {
         'test_list_subkey_after_generation', 'test_quick_sign_key'
     ]),
     'import':
-    set(['test_import_only', 'test_doctest_import_keys']),
+    set([
+        'test_import_only', 'test_doctest_import_keys', 'test_controlled_import',
+        'test_controlled_import_rejects_extra_primary', 'test_controlled_import_rejects_secret_material',
+        'test_controlled_import_rejects_bad_data', 'test_controlled_import_existing_keys_and_ownertrust',
+        'test_controlled_import_file'
+    ]),
     'basic':
     set(['test_environment', 'test_list_keys_initial', 'test_nogpg', 'test_make_args', 'test_quote_with_shell']),
     'test':
