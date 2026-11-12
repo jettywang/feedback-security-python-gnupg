@@ -297,13 +297,34 @@ class Verify(StatusHandler):
         self.sig_timestamp = None
         self.trust_text = None
         self.trust_level = None
+        # sig_info is keyed by signature id. A failed or unverified signature never gets a
+        # SIG_ID from gpg, so a synthetic key is allocated for it (see _new_sig_slot).
         self.sig_info = {}
+        # Per-signature records in the order gpg reported them, including signatures which
+        # failed verification. Mirrors the values of sig_info for signatures with a SIG_ID.
+        self.signatures = []
         self.problems = []
+        self._sig_counter = 0
 
     def __nonzero__(self):  # pragma: no cover
         return self.valid
 
     __bool__ = __nonzero__
+
+    def _new_sig_slot(self, sig_id=None):
+        # Allocate (or switch to) the record for the signature currently being reported.
+        # gpg only sends a SIG_ID for signatures it can verify, so failed or unverified
+        # signatures get a synthetic, non-colliding key. Every signature, whatever its
+        # outcome, gets an entry in both sig_info and the ordered signatures list.
+        if sig_id is None:
+            self._sig_counter += 1
+            sig_id = 'sig-%d' % self._sig_counter
+        if sig_id not in self.sig_info:
+            info = {}
+            self.sig_info[sig_id] = info
+            self.signatures.append(info)
+        self.signature_id = sig_id
+        return self.sig_info[sig_id]
 
     def handle_status(self, key, value):
 
@@ -329,6 +350,7 @@ class Verify(StatusHandler):
             self.valid = False
             self.status = 'signature bad'
             self.key_id, self.username = value.split(None, 1)
+            self._new_sig_slot()
             self.problems.append({'status': self.status, 'keyid': self.key_id, 'user': self.username})
             update_sig_info(keyid=self.key_id, username=self.username, status=self.status)
         elif key == 'ERRSIG':  # pragma: no cover
@@ -339,6 +361,10 @@ class Verify(StatusHandler):
             if len(parts) >= 7:
                 self.fingerprint = parts[6]
             self.status = 'signature error'
+            # NO_PUBKEY/NO_SECKEY for the same signature may already have opened a slot;
+            # reuse it rather than creating a second record for one signature.
+            if not self.signature_id:
+                self._new_sig_slot()
             update_sig_info(keyid=self.key_id,
                             timestamp=self.timestamp,
                             fingerprint=self.fingerprint,
@@ -353,12 +379,17 @@ class Verify(StatusHandler):
             self.valid = False
             self.status = 'signature expired'
             self.key_id, self.username = value.split(None, 1)
+            self._new_sig_slot()
             update_sig_info(keyid=self.key_id, username=self.username, status=self.status)
             self.problems.append({'status': self.status, 'keyid': self.key_id, 'user': self.username})
         elif key == 'GOODSIG':
             self.valid = True
             self.status = 'signature good'
             self.key_id, self.username = value.split(None, 1)
+            # Normally SIG_ID has already opened the slot. A bare GOODSIG without one
+            # (older gpg streams) still needs a record, so allocate a synthetic slot.
+            if not self.signature_id:
+                self._new_sig_slot()
             update_sig_info(keyid=self.key_id, username=self.username, status=self.status)
         elif key == 'VALIDSIG':
             parts = value.split()
@@ -377,17 +408,25 @@ class Verify(StatusHandler):
                             status=self.status)
         elif key == 'SIG_ID':
             sig_id, creation_date, timestamp = value.split()
-            self.sig_info[sig_id] = {'creation_date': creation_date, 'timestamp': timestamp}
-            (self.signature_id, self.creation_date, self.timestamp) = (sig_id, creation_date, timestamp)
+            # Reuse an existing slot (e.g. opened by NEWSIG handling) instead of
+            # clobbering anything already recorded for this signature.
+            self._new_sig_slot(sig_id)
+            self.sig_info[sig_id].update({'creation_date': creation_date,
+                                          'timestamp': timestamp})
+            (self.creation_date, self.timestamp) = (creation_date, timestamp)
         elif key == 'NO_PUBKEY':  # pragma: no cover
             self.valid = False
             self.key_id = value
             self.status = 'no public key'
+            self._new_sig_slot()
+            update_sig_info(keyid=self.key_id, status=self.status)
             self.problems.append({'status': self.status, 'keyid': self.key_id})
         elif key == 'NO_SECKEY':  # pragma: no cover
             self.valid = False
             self.key_id = value
             self.status = 'no secret key'
+            self._new_sig_slot()
+            update_sig_info(keyid=self.key_id, status=self.status)
             self.problems.append({'status': self.status, 'keyid': self.key_id})
         elif key in ('EXPKEYSIG', 'REVKEYSIG'):  # pragma: no cover
             # signed with expired or revoked key
@@ -398,6 +437,7 @@ class Verify(StatusHandler):
             else:
                 self.key_status = 'signing key was revoked'
             self.status = self.key_status
+            self._new_sig_slot()
             update_sig_info(status=self.status, keyid=self.key_id)
             self.problems.append({'status': self.status, 'keyid': self.key_id})
         elif key in ('UNEXPECTED', 'FAILURE'):  # pragma: no cover
@@ -436,9 +476,69 @@ class Verify(StatusHandler):
             pass
         elif key in ('NEWSIG', ):
             # Only sent in gpg2. Clear any signature ID, to be set by a following SIG_ID
+            # (or by a failure status such as BADSIG/ERRSIG, which allocates a synthetic id).
             self.signature_id = None
         else:  # pragma: no cover
             logger.debug('message ignored: %r, %r', key, value)
+
+    # Status values which mean the cryptographic checks passed for a signature.
+    # GOODSIG sets 'signature good', then VALIDSIG overwrites it with 'signature valid'.
+    GOOD_STATUSES = ('signature good', 'signature valid')
+
+    def _fingerprint_matches(self, info, fingerprint):
+        # A subkey signature reports the signing subkey in 'fingerprint' and the primary
+        # key in 'pubkey_fingerprint'; either one is accepted for a configured signer.
+        wanted = fingerprint.upper()
+        candidates = (info.get('fingerprint'), info.get('pubkey_fingerprint'))
+        return any(c and c.upper() == wanted for c in candidates)
+
+    def signatures_for_fingerprint(self, fingerprint):
+        """
+        Return the per-signature records made by *fingerprint*.
+
+        Every signature seen during verification is represented, including ones which
+        failed or could not be checked (unknown public key). Each record is a dictionary
+        with the same keys as the values of :attr:`sig_info` plus a ``status`` key.
+
+        Args:
+            fingerprint (str): The configured signer fingerprint. Both the signing key
+                fingerprint and the primary-key fingerprint (``pubkey_fingerprint``) are
+                compared, so subkey signatures match their primary key.
+        Returns:
+            list[dict]: The matching records, in the order gpg reported them.
+        """
+        return [info for info in self.signatures
+                if self._fingerprint_matches(info, fingerprint)]
+
+    def is_fingerprint_valid(self, fingerprint):
+        """
+        Return whether at least one cryptographically valid signature was made by the key
+        identified by *fingerprint*.
+
+        This is the recommended check for releases which may carry several signatures:
+        unlike ``bool(result)`` it does not depend on the order in which gpg reports the
+        signatures, and unlike ``result.returncode`` it proves that *this configured
+        signer* produced a valid signature rather than merely that nothing went wrong.
+
+        Args:
+            fingerprint (str): A configured, trusted signer fingerprint.
+        Returns:
+            bool: ``True`` if a matching signature has a good/valid status.
+        """
+        return any(info.get('status') in self.GOOD_STATUSES
+                   for info in self.signatures_for_fingerprint(fingerprint))
+
+    def valid_fingerprints(self):
+        """
+        Return the fingerprints of every signature whose cryptographic checks passed.
+        """
+        result = []
+        for info in self.signatures:
+            if info.get('status') in self.GOOD_STATUSES:
+                fp = info.get('fingerprint')
+                if fp and fp not in result:
+                    result.append(fp)
+        return result
 
 
 class ImportResult(StatusHandler):

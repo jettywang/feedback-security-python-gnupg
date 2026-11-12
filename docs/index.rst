@@ -1406,13 +1406,56 @@ data that was signed should be in a separate file whose path is indicated by
 
    * ``trust_text`` - the text corresponding to the trust level.
 
-   Note that only information for valid signatures will be present in ``sig_info``.
+   Signatures which fail verification or cannot be checked (for example an unknown public
+   key) do not receive a ``SIG_ID`` from ``gpg``; they are stored under a synthetic
+   signature id and are also listed in the ``signatures`` attribute and ``problems``.
 
 When a signature is verified, signer information is held in attributes of
 ``verified``: ``username``, ``key_id``, ``signature_id``, ``fingerprint``,
 ``trust_level`` and ``trust_text``. If the message wasn't signed, these attributes
 will all be set to ``None``. If there were multiple signatures, the last values seen
 will be shown.
+
+Checking several signatures against configured signers
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A release artefact sometimes carries more than one signature, and a single verification
+run can then report both a ``VALIDSIG`` and a ``BADSIG``. In that situation the three
+pieces of evidence each prove something different:
+
+* ``bool(verified)`` (the ``valid`` attribute) only reflects the *last* signature status
+  reported by ``gpg``. With mixed good and bad signatures its value depends on the order
+  in which the signatures appear, so it is not a reliable overall verdict.
+
+* ``verified.returncode`` is the exit code of the ``gpg`` child process. It is non-zero if
+  at least one signature could not be validated, but a zero code does not say *which*
+  signer signed, and a non-zero code does not tell you whether a particular trusted signer
+  still produced a good signature.
+
+* The per-signature records give the signer and outcome of each signature individually.
+  They are available in ``verified.signatures`` (an ordered list of dictionaries, one per
+  signature, including failed and unverified ones) and in ``verified.sig_info``.
+
+To make a decision based on the fingerprints of the signers you have explicitly
+configured, use :meth:`~gnupg.Verify.is_fingerprint_valid`::
+
+    configured_signers = {alice_fingerprint, bob_fingerprint}
+    verified = gpg.verify(data)
+    accepted = {fp for fp in configured_signers
+                if verified.is_fingerprint_valid(fp)}
+    if not accepted:
+        raise ValueError('No signature from a configured signer was valid')
+
+``is_fingerprint_valid`` matches both the signing-key fingerprint and the primary-key
+fingerprint (``pubkey_fingerprint``), so a signature made by a signing subkey is correctly
+attributed to its primary key. :meth:`~gnupg.Verify.signatures_for_fingerprint` returns the
+underlying records for a fingerprint, and :meth:`~gnupg.Verify.valid_fingerprints` lists
+every fingerprint whose cryptographic checks passed.
+
+.. versionadded:: 0.5.8
+   The ``signatures`` attribute and the ``is_fingerprint_valid``,
+   ``signatures_for_fingerprint`` and ``valid_fingerprints`` methods were added, and
+   failed/unverified signatures are now also recorded (under synthetic signature ids).
 
 The trust levels are (in increasing order) TRUST_UNDEFINED, TRUST_NEVER,
 TRUST_MARGINAL, TRUST_FULLY and TRUST_ULTIMATE. If verification succeeded, you can

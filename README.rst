@@ -77,6 +77,15 @@ Change log
 
 Released: Not yet
 
+* Verification results now keep a per-signature record for *every* signature, including
+  failed ones and signatures from unknown public keys (which get a synthetic signature id),
+  in the new ``signatures`` attribute as well as ``sig_info``. New
+  ``is_fingerprint_valid()``, ``signatures_for_fingerprint()`` and ``valid_fingerprints()``
+  methods let callers decide based on configured signer fingerprints. This is reliable for
+  artefacts carrying multiple signatures, where ``bool(result)`` depends on signature order
+  and ``returncode`` only indicates that some signature failed. Single-signature behaviour is
+  unchanged.
+
 0.5.7
 -----
 

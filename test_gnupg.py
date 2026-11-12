@@ -1747,7 +1747,17 @@ def suite(args=None):
     if args is None:  # pragma: no cover
         args = sys.argv[1:]
     if not args:
-        result = unittest.TestLoader().loadTestsFromTestCase(GPGTestCase)
+        loader = unittest.TestLoader()
+        result = unittest.TestSuite()
+        result.addTests(loader.loadTestsFromTestCase(GPGTestCase))
+        # Deterministic multi-signature verification regressions (canned status streams
+        # and a fake gpg subprocess); the real-gpg cases self-skip without an agent.
+        from test_verify_regression import (VerifyStatusStreamTestCase,
+                                            VerifySubprocessTestCase,
+                                            RealGPGVerificationTestCase)
+        for case in (VerifyStatusStreamTestCase, VerifySubprocessTestCase,
+                     RealGPGVerificationTestCase):
+            result.addTests(loader.loadTestsFromTestCase(case))
     else:  # pragma: no cover
         tests = set()
         for arg in args:
